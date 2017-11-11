@@ -159,7 +159,9 @@ class dataPnt{
         double scr45;
         double scr90;
         double scr180;
-        double maxVal; 
+        double maxVal;
+        double cdf;
+        
 
         dataPnt(){
             setupMask();
@@ -237,8 +239,10 @@ class dataPnt{
             ampNormed.copyTo(tmp);
             Mat histimg = Mat::zeros(512,512,CV_8UC3);
             pixelCnt = 0;
+            cdf = 0;
             for(int i=0;i<256;++i){
                 pixelCnt += histNormed[i];
+                cdf += i/256.0 * histNormed[i];
                 line(histimg,Point(0,i*2),Point(histNormed[i],i*2),Scalar(0,255,0));
                 line(histimg,Point(0,i*2+1),Point(hist[i],i*2+1),Scalar(255,0,0));
             }
@@ -327,9 +331,10 @@ class neuralClassifer:public classifer{
         Mat layers;
         Ptr<ANN_MLP> nnetwork;
         int input_size;
+        bool beenTrained;
     public:
         neuralClassifer(){
-            input_size = 6;
+            input_size = 7;
             Mat_<int> layers(4,1);
             layers(0) = input_size;     // input
             layers(1) = 15;  // hidden
@@ -338,10 +343,12 @@ class neuralClassifer:public classifer{
             nnetwork = ANN_MLP::create();
             nnetwork->setLayerSizes(layers);
             nnetwork->setActivationFunction( ANN_MLP::SIGMOID_SYM, 0.6, 1);
-            nnetwork->setTermCriteria(TermCriteria(TermCriteria::MAX_ITER+TermCriteria::EPS, 3000, 0.0001));
-            nnetwork->setTrainMethod(ml::ANN_MLP::BACKPROP, 0.0001);
+            nnetwork->setTermCriteria(TermCriteria(TermCriteria::MAX_ITER + TermCriteria::EPS, 1000000, 0.000001));
+            nnetwork->setTrainMethod(ml::ANN_MLP::BACKPROP, 0.0001,0.0001);
+            beenTrained = false;
         }
         void reset(){
+            beenTrained = false;
         }
         void train(vector<dataPnt> input){
             Mat training_data = Mat(input.size(),input_size,CV_32FC1);
@@ -353,9 +360,11 @@ class neuralClassifer:public classifer{
                 training_data.at<float>(Point(3,i)) = input[i].scr90;
                 training_data.at<float>(Point(4,i)) = input[i].scr180;
                 training_data.at<float>(Point(5,i)) = input[i].maxVal; 
+                training_data.at<float>(Point(6,i)) = input[i].cdf; 
                 training_output.at<float>(Point(0,i)) = 2*(input[i].isIceberg-0.5); 
             }
-            int iterations = nnetwork->train(training_data, ROW_SAMPLE,training_output);
+            Ptr<TrainData> td = TrainData::create(training_data, ROW_SAMPLE,training_output);
+            int iterations = nnetwork->train(td,(beenTrained?ANN_MLP::UPDATE_WEIGHTS:0) + ANN_MLP::NO_INPUT_SCALE);
             cout << iterations << endl;
         }
         void classify(vector<dataPnt>& input){
@@ -368,10 +377,13 @@ class neuralClassifer:public classifer{
                 test_data.at<float>(Point(3,i)) = input[i].scr90;
                 test_data.at<float>(Point(4,i)) = input[i].scr180;
                 test_data.at<float>(Point(5,i)) = input[i].maxVal; 
+                test_data.at<float>(Point(6,i)) = input[i].cdf; 
             }
             nnetwork->predict(test_data,test_output);
             for(int i=0;i<input.size();++i){
                 input[i].isIceberg = (test_output.at<float>(Point(0,i)) + 1)/2.0;
+                if(input[i].isIceberg > 1) input[i].isIceberg = 1;
+                if(input[i].isIceberg < 0) input[i].isIceberg = 0;
             }
         }
 };
@@ -396,6 +408,7 @@ class tester{
         float tf = 0;
         float ft = 0;
         float ff = 0;
+        float totalLogloss = 0;
         for(int i=0;i<splits;++i){
             float ltt = 0;
             float ltf = 0;
@@ -417,7 +430,13 @@ class tester{
             }
             dut->train(toTrain);
             dut->classify(toTest);
+            float logloss = 0;
             for(int j=0;j<truth.size();++j){
+                float rlt = toTest[j].isIceberg;
+                if(!truth[j]) rlt = 1 - rlt;
+                if(rlt < 1e-15) rlt = 1e-15;
+                if(rlt > 1-1e-15) rlt = 1-1e-15;
+                logloss += log(rlt);
                 if(toTest[j].isIceberg > 0.5){
                     if(truth[j]){
                         ltt = ltt + 1;
@@ -432,19 +451,24 @@ class tester{
                     }
                 }
             }
+            totalLogloss += logloss;
+            logloss /= truth.size();
             tt += ltt;
             tf += ltf;
             ft += lft;
             ff += lff;
             cout << (ltt/toTest.size()) << "," << (ltf/toTest.size()) << "," << (lft/toTest.size()) << "," << (lff/toTest.size()) << endl;
             cout << "Accuracy: " << ((ltt+lff)/toTest.size()) << endl;
+            cout << "Logloss: " << logloss << endl;
         }
         tt /= fullset.size();
         tf /= fullset.size();
         ft /= fullset.size();
         ff /= fullset.size();
+        totalLogloss /= fullset.size();
         cout << tt << "," << tf << "," << ft << "," << ff << endl;
         cout << "Accuracy: " << (tt+ff) << endl;
+        cout << "Logloss: " << totalLogloss << endl;
     }
 };
 
@@ -492,7 +516,7 @@ int main(int argc, char** argv){
         experiment.test(dut);
 
         vector<dataPnt> testData;
-        for(int i=0;i>root_test.size(); ++i){
+        for(int i=0;i<root_test.size(); ++i){
             dataPnt tmp;
             if(!root_test[i]["inc_angle"].isString()){
                 tmp.hasAng = true;
@@ -511,7 +535,19 @@ int main(int argc, char** argv){
             tmp.preprocess();
             testData.push_back(tmp);
         }
+        cout << "Test set size: " <<  testData.size() << endl;
         dut->classify(testData);
+
+        ofstream result;
+        result.open("data/result.csv");
+
+        result << "id,is_iceberg" << endl;
+        for(auto i:testData){
+            result << i.id << "," << i.isIceberg << endl;
+        }
+
+        result.close();
+
         //waitKey();
     } else
         cout << "json is not correct format !!" << endl;
